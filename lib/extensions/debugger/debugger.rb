@@ -11,6 +11,8 @@ class DAPServer
     @next_var_ref = 1
     @variables_map = {} # variablesReference => [binding, :local | :instance | :global]
     @step_mode = nil
+    @stopped = false
+    @wait_for_continue = false
     @server = TCPServer.new(host, port)
     puts "DAP server listening on #{host}:#{port}"
   end
