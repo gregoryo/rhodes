@@ -40,6 +40,8 @@ class DAPServer
     @next_var_ref = 1
     @variables_map = {} # variablesReference => [binding, :local | :instance | :global]
     @step_mode = nil
+    @stopped = false
+    @wait_for_continue = false
     @server = TCPServer.new(host, port)
     puts "DAP server listening on #{host}:#{port}"
   end
@@ -359,7 +361,25 @@ class DAPServer
   # @return [void]
   def handle_disconnect(req)
     send_response(req)
-    # Additional logic: stop processing, close connection, etc.
+    
+    # Stop tracing
+    set_trace_func(nil)
+    
+    # Clean up state
+    @stopped = false
+    @wait_for_continue = false
+    @step_mode = nil
+    @current_binding = nil
+    
+    # Clear data structures
+    @breakpoints.clear
+    @stack_frames.clear
+    @frame_bindings.clear
+    @variables_map.clear
+    @next_var_ref = 1
+    
+    # Close client connection
+    @client&.close
   end
 
   # Handles the DAP 'evaluate' request to evaluate an expression.
@@ -573,7 +593,19 @@ end
 
 # === Запуск ===
 
-debug_host = ENV["DEBUG_HOST"] || "127.0.0.1"
+# Validate DEBUG_HOST for security - only allow localhost addresses
+requested_host = ENV["DEBUG_HOST"] || "127.0.0.1"
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "::1"].freeze
+
+if ALLOWED_HOSTS.include?(requested_host)
+  debug_host = requested_host
+else
+  puts "[WARNING] DEBUG_HOST is not allowed for security reasons."
+  puts "[WARNING] Only localhost addresses (127.0.0.1, localhost, ::1) are permitted."
+  puts "[WARNING] Falling back to 127.0.0.1"
+  debug_host = "127.0.0.1"
+end
+
 debug_port = (ENV["DEBUG_PORT"] || 9000).to_i
 
 Thread.new do
