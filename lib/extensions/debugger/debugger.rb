@@ -357,7 +357,7 @@ ALLOWED_HOSTS = ["127.0.0.1", "localhost", "::1"].freeze
 if ALLOWED_HOSTS.include?(requested_host)
   debug_host = requested_host
 else
-  puts "[WARNING] DEBUG_HOST='#{requested_host}' is not allowed for security reasons."
+  puts "[WARNING] DEBUG_HOST is not allowed for security reasons."
   puts "[WARNING] Only localhost addresses (127.0.0.1, localhost, ::1) are permitted."
   puts "[WARNING] Falling back to 127.0.0.1"
   debug_host = "127.0.0.1"
