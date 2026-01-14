@@ -370,7 +370,19 @@ end
 
 # === Запуск ===
 
-debug_host = ENV["DEBUG_HOST"] || "127.0.0.1"
+# Validate DEBUG_HOST for security - only allow localhost addresses
+requested_host = ENV["DEBUG_HOST"] || "127.0.0.1"
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "::1"].freeze
+
+if ALLOWED_HOSTS.include?(requested_host)
+  debug_host = requested_host
+else
+  puts "[WARNING] DEBUG_HOST is not allowed for security reasons."
+  puts "[WARNING] Only localhost addresses (127.0.0.1, localhost, ::1) are permitted."
+  puts "[WARNING] Falling back to 127.0.0.1"
+  debug_host = "127.0.0.1"
+end
+
 debug_port = (ENV["DEBUG_PORT"] || 9000).to_i
 
 Thread.new do
