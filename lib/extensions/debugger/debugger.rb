@@ -203,7 +203,25 @@ class DAPServer
 
   def handle_disconnect(req)
     send_response(req)
-    # Доп. логика: остановить обработку, закрыть соединение и т. д.
+    
+    # Stop tracing
+    set_trace_func(nil)
+    
+    # Clean up state
+    @stopped = false
+    @wait_for_continue = false
+    @step_mode = nil
+    @current_binding = nil
+    
+    # Clear data structures
+    @breakpoints.clear
+    @stack_frames.clear
+    @frame_bindings.clear
+    @variables_map.clear
+    @next_var_ref = 1
+    
+    # Close client connection
+    @client&.close
   end
 
   def handle_evaluate(req)
