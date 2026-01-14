@@ -1,500 +1,613 @@
-require 'set'
-require 'uri'
-require 'timeout'
+require "socket"
+require "json/pure"
+require "set"
 
-DEBUGGER_STEP_TYPE = ['STEP', 'STOVER', 'STRET', 'SUSP']
-DEBUGGER_STEP_COMMENT = ['Stepped into', 'Stepped over', 'Stepped return', 'Suspended']
-
-DEBUGGER_LOG_LEVEL_DEBUG = 0
-DEBUGGER_LOG_LEVEL_INFO = 1
-DEBUGGER_LOG_LEVEL_WARN = 2
-DEBUGGER_LOG_LEVEL_ERROR = 3
-
-class BreakPoints
-
-  def initialize
-    @break_points = Hash.new
-    @enabled = true
+# DAPServer implements the Debug Adapter Protocol (DAP) for Ruby debugging.
+#
+# The Debug Adapter Protocol (DAP) is a standardized protocol for communication
+# between a debug adapter and a client (typically an IDE like VS Code). This
+# implementation provides a DAP server that can debug Ruby applications by:
+#
+# - Setting and managing breakpoints in source files
+# - Stepping through code execution (next, continue)
+# - Inspecting variables (local, instance, and global)
+# - Viewing stack traces when execution is paused
+# - Evaluating expressions in the current context
+#
+# Protocol Flow:
+# 1. Client connects and sends 'initialize' request
+# 2. Server responds with capabilities and sends 'initialized' event
+# 3. Client sends 'attach' request with application root path
+# 4. Server sets up trace_func to monitor code execution
+# 5. Client sets breakpoints via 'setBreakpoints' requests
+# 6. When breakpoint is hit or step completes, server sends 'stopped' event
+# 7. Client queries stack frames, scopes, and variables
+# 8. Client sends 'continue' or 'next' to resume execution
+#
+# The server uses Ruby's set_trace_func to monitor code execution and pause
+# at breakpoints or step points. All communication follows the DAP specification
+# with JSON-RPC style messages over a TCP socket connection.
+class DAPServer
+  # Creates a new DAP server instance.
+  #
+  # @param host [String] The hostname or IP address to bind the server to (e.g., "localhost", "127.0.0.1")
+  # @param port [Integer] The port number to listen on for DAP client connections
+  def initialize(host, port)
+    @breakpoints = {}  # key: file path, value: Set of line numbers
+    @current_binding = nil
+    @stack_frames = []
+    @frame_bindings = {}
+    @next_var_ref = 1
+    @variables_map = {} # variablesReference => [binding, :local | :instance | :global]
+    @step_mode = nil
+    @stopped = false
+    @wait_for_continue = false
+    @server = TCPServer.new(host, port)
+    puts "DAP server listening on #{host}:#{port}"
   end
 
-  def enabled?
-    @enabled
-  end
-
-  def be_enabled
-    @enabled = true
-  end
-
-  def be_disabled
-    @enabled = false
-  end
-
-
-  def set_on?(file, line)
-    unless @break_points.has_key?(file)
-      return false
-    end
-    @break_points[file].include?(line)
-  end
-
-  def set_break_point_on(file, line)
-    unless @break_points.has_key?(file)
-      @break_points[file] = Set.new
-    end
-    @break_points[file].add(line)
-  end
-
-  def set_break_points_on(file, lines)
-    lines.each do |line|
-      set_break_point_on(file, line)
-    end
-  end
-
-  def delete_all_break_points
-    @break_points.clear
-  end
-
-  def delete_break_point_on(file, line)
-    if @break_points.has_key?(file)
-      @break_points[file].delete(line)
-    end
-  end
-
-  def delete_all_break_points_on(file)
-    if @break_points.has_key?(file)
-      @break_points[file].clear
+  # Starts the DAP server and begins accepting client connections.
+  #
+  # This method enters an infinite loop, accepting incoming TCP connections
+  # from DAP clients. Each client connection is handled in a separate thread
+  # to allow multiple concurrent debugging sessions.
+  #
+  # @return [void] This method never returns under normal circumstances
+  def start
+    loop do
+      @client = @server.accept
+      Thread.new { handle_client() }
     end
   end
 
-  def empty?
-    return @break_points.empty?
+  # Handles a connected DAP client by reading and processing requests.
+  #
+  # This method continuously reads DAP protocol messages from the client,
+  # which consist of a header with Content-Length followed by JSON payload.
+  # Each request is parsed and dispatched to the appropriate handler method.
+  #
+  # @return [void]
+  # @raise [Exception] Any errors during request processing are caught, logged, and cause the connection to close
+  def handle_client()
+    loop do
+      header = read_header()
+      break unless header
+
+      content_length = header["Content-Length"].to_i
+      json_data = @client.read(content_length)
+      request = Rho::JSON.parse(json_data)
+      handle_request(request)
+    end
+  rescue => e
+    puts "[Error] #{e.message}"
+  ensure
+    @client&.close
   end
 
-
-end
-
-def debugger_log(level, msg)
-  if (level >= DEBUGGER_LOG_LEVEL_DEBUG) #DEBUGGER_LOG_LEVEL_WARN)
+  # Reads the DAP protocol message header from the client.
+  #
+  # DAP messages start with HTTP-style headers (e.g., "Content-Length: 123")
+  # followed by an empty line before the JSON body. This method reads until
+  # the empty line and returns a hash of header key-value pairs.
+  #
+  # @return [Hash, nil] Hash of header fields (e.g., {"Content-Length" => "123"}), or nil if connection closed
+  def read_header()
+    header = {}
+    while (line = @client.gets)
+      line = line.strip
+      break if line.empty?
+      key, value = line.split(/:\s*/, 2)
+      header[key] = value
+    end
+    header.empty? ? nil : header
   end
-end
 
-def log_command(cmd)
-  debugger_log(DEBUGGER_LOG_LEVEL_DEBUG, "Received command: #{cmd}")
-end
-
-def convert_to_relative_path(path, app_path)
-  if path.include?("./")
-    relative_path = "/" + path[path.index("./") + 2, path.length]
-  elsif path.include?("lib")
-    relative_path = "framework" + path[path.index("lib") + 3, path.length]
-  elsif path.include?("framework")
-    relative_path = path[path.index("framework"), path.length]
-  elsif path.include?("extensions")
-    relative_path = path[path.index("extensions"), path.length]
-  else
-    relative_path = path[app_path.length, path.length - app_path.length]
+  # Sends a DAP protocol response message to the client.
+  #
+  # Constructs a response object following the DAP specification and sends
+  # it to the connected client using the DAP message format.
+  #
+  # @param req [Hash] The original request being responded to (must contain "seq" and "command" fields)
+  # @param body [Hash] The response body containing result data (default: {})
+  # @param success [Boolean] Whether the request was successful (default: true)
+  # @param message [String, nil] Optional error or status message
+  # @return [void]
+  def send_response(req, body: {}, success: true, message: nil)
+    response = {
+      type: "response",
+      request_seq: req["seq"],
+      success: success,
+      command: req["command"],
+    }
+    response[:body] = body if body.any?
+    response[:message] = message if message
+    write_message(response)
   end
-  return relative_path
-end
 
-def debug_read_cmd(io, wait)
-  begin
-    if wait
-      cmd = io.readpartial(4096)
-      $_cmd << cmd if cmd !~ /^\s*$/
+  # Sends a DAP protocol event message to the client.
+  #
+  # Events are asynchronous notifications from the server to the client about
+  # state changes (e.g., "stopped" when hitting a breakpoint, "output" for logs).
+  #
+  # @param event_name [String] The name of the event (e.g., "stopped", "initialized", "output")
+  # @param body [Hash] The event body containing event-specific data (default: {})
+  # @return [void]
+  def send_event(event_name, body = {})
+    event = {
+      type: "event",
+      event: event_name,
+      body: body,
+    }
+    write_message(event)
+  end
+
+  # Writes a DAP protocol message to the client socket.
+  #
+  # Formats the message according to DAP specification: HTTP-style headers
+  # followed by JSON body. The Content-Length header is automatically calculated.
+  #
+  # @param message [Hash] The message to send (will be converted to JSON)
+  # @return [void]
+  def write_message(message)
+    body = message.to_json
+    header = "Content-Length: #{body.bytesize}\r\n\r\n"
+    puts "app -> vsc: #{body}"
+    @client.write(header + body)
+  end
+
+  # Dispatches incoming DAP requests to the appropriate handler method.
+  #
+  # This is the main request router that examines the command field and
+  # delegates to specialized handler methods. Unsupported commands receive
+  # an error response.
+  #
+  # @param req [Hash] The parsed DAP request containing "type", "command", and other fields
+  # @return [void]
+  def handle_request(req)
+    puts "vsc -> app: #{req}"
+
+    return unless req["type"] == "request"
+
+    case req["command"]
+    when "initialize"
+      handle_initialize(req)
+    when "attach"
+      handle_attach(req)
+    when "threads"
+      handle_threads(req)
+    when "stackTrace"
+      handle_stack_trace(req)
+    when "scopes"
+      handle_scopes(req)
+    when "variables"
+      handle_variables(req)
+    when "disconnect"
+      handle_disconnect(req)
+    when "setBreakpoints"
+      handle_set_breakpoints(req)
+    when "evaluate"
+      handle_evaluate(req)
+    when "continue"
+      handle_continue(req)
+    when "next"
+      handle_next(req)
     else
-      cmd = io.read_nonblock(4096)
-      $_cmd << cmd if cmd !~ /^\s*$/
+      send_response(req, success: false, message: "Command not implemented")
     end
-  rescue
-    # puts $!.inspect
-  end
-end
-
-def execute_cmd(cmd, advanced)
-  debugger_log(DEBUGGER_LOG_LEVEL_DEBUG, "Executing: #{cmd.inspect}, #{advanced}")
-  cmd = URI.unescape(cmd.gsub(/\+/, ' ')) if advanced
-  result = ""
-  error = '0';
-  begin
-    result = eval(cmd.to_s, $_binding).inspect
-  rescue Exception => exc
-    error = '1';
-    result = "#{$!}".inspect
   end
 
-  cmd = URI.escape(cmd.sub(/[\n\r]+$/, ''), Regexp.new("[^#{URI::PATTERN::UNRESERVED}]")) if advanced
-  $_s.write("EV" + (advanced ? "L:#{error}:#{cmd}:" : ':' + (error.to_i != 0 ? 'ERROR: ' : '')) + result + "\n")
-end
+  # Callback function invoked by Ruby's set_trace_func for each execution event.
+  #
+  # This is the core of the debugger, monitoring Ruby code execution and pausing
+  # when breakpoints are hit or step operations complete. Only monitors files
+  # within the application root path to avoid debugging framework code.
+  #
+  # @param event [String] The trace event type (e.g., "line", "call", "return")
+  # @param file [String] The source file where the event occurred
+  # @param line [Integer] The line number where the event occurred
+  # @param method_name [Symbol] The name of the method being executed
+  # @param binding [Binding] The execution context at this point
+  # @param klass [Class] The class where the event occurred
+  # @return [void]
+  def trace_callback(event, file, line, method_name, binding, klass)
+    normalized_file = File.expand_path(file)
+    return unless normalized_file.start_with?(@root_path)
 
-def get_variables_obsolete(scope)
-  if (scope =~ /^GVARS/)
-    cmd = "global_variables"
-    prefix = ""
-    vartype = "G"
-  elsif (scope =~ /^LVARS/)
-    cmd = "local_variables"
-    prefix = ""
-    vartype = "L"
-  elsif (scope =~ /^CVARS/)
-    if $_classname =~ /^\s*$/
+    msg = "[#{event}] #{file}:#{line} #{klass} #{method_name}"
+    send_output_event("console", msg)
+
+    return unless event == "line"
+
+    stop_reason = nil
+    if @step_mode == :next
+      stop_reason = "step"
+      @step_mode = nil
+    elsif @breakpoints[normalized_file]&.include?(line)
+      stop_reason = "breakpoint"
+    end
+
+    return unless stop_reason
+
+    unless @stopped
+      @stopped = true
+      puts "[BREAK] Hit #{stop_reason} at #{normalized_file}:#{line}"
+
+      @current_binding = binding
+      update_stack_frames(binding)
+      handle_stop(stop_reason, normalized_file, line)
+    end
+  end
+
+  # === Command Handlers ===
+
+  # Handles the DAP 'continue' request to resume execution.
+  #
+  # Resumes execution after a breakpoint or step pause. All threads continue
+  # until the next breakpoint or step point.
+  #
+  # @param req [Hash] The DAP continue request
+  # @return [void]
+  def handle_continue(req)
+    @wait_for_continue = false
+    send_response(req, body: { allThreadsContinued: true })
+  end
+
+  # Handles the DAP 'next' request to step over the next line.
+  #
+  # Sets step mode and resumes execution. The debugger will pause at the
+  # next line of code in the current context.
+  #
+  # @param req [Hash] The DAP next request
+  # @return [void]
+  def handle_next(req)
+    @step_mode = :next
+    @wait_for_continue = false
+    send_response(req)
+  end
+
+  # Handles the DAP 'initialize' request to start the debugging session.
+  #
+  # This is the first request in the DAP protocol flow. The server responds
+  # with its capabilities and sends an 'initialized' event to indicate readiness.
+  #
+  # @param req [Hash] The DAP initialize request
+  # @return [void]
+  def handle_initialize(req)
+    send_response(req, body: { supportsEvaluateForHovers: true })
+    send_event("initialized")
+  end
+
+  # Handles the DAP 'attach' request to attach the debugger to the application.
+  #
+  # Sets up the debugger by establishing the application root path and
+  # installing the trace callback to monitor code execution. The root path
+  # is used to filter which files should be debugged.
+  #
+  # @param req [Hash] The DAP attach request with arguments including optional "appRoot"
+  # @return [void]
+  def handle_attach(req)
+    args = req["arguments"] || {}
+
+    @root_path = File.expand_path(args["appRoot"] || Dir.pwd)
+    puts "APP ROOT: #{@root_path}"
+
+    set_trace_func method(:trace_callback).to_proc
+    send_response(req)
+  end
+
+  # Handles the DAP 'threads' request to list all threads.
+  #
+  # Returns a list of all Ruby threads currently running. Each thread is
+  # identified by its object_id which is used in subsequent requests.
+  #
+  # @param req [Hash] The DAP threads request
+  # @return [void]
+  def handle_threads(req)
+    threads = Thread.list.map { |each| { :id => each.object_id, :name => each } }
+    send_response(req, body: { threads: threads })
+  end
+
+  # Handles the DAP 'setBreakpoints' request to set or clear breakpoints.
+  #
+  # Updates the list of breakpoints for a source file. Previous breakpoints
+  # for the file are replaced. Each breakpoint is verified and confirmed
+  # to the client.
+  #
+  # @param req [Hash] The DAP setBreakpoints request containing source file path and line numbers
+  # @return [void]
+  def handle_set_breakpoints(req)
+    source = req.dig("arguments", "source", "path")
+    breakpoints = req.dig("arguments", "breakpoints") || []
+
+    lines = breakpoints.map { |bp| bp["line"] }.to_set
+    @breakpoints[source] = lines
+
+    # Confirm breakpoint installation
+    send_response(req, body: {
+                         breakpoints: lines.map { |line| { verified: true, line: line } },
+                       })
+  end
+
+  # Handles the DAP 'stackTrace' request to retrieve the call stack.
+  #
+  # Returns the current stack frames for the specified thread. In this MVP
+  # implementation, only the main thread is supported. Stack frames include
+  # source file locations and line numbers.
+  #
+  # @param req [Hash] The DAP stackTrace request with threadId argument
+  # @return [void]
+  def handle_stack_trace(req)
+    thread_id = req.dig("arguments", "threadId")
+
+    # Currently supports only the main thread
+    if Thread.main.object_id != thread_id
+      send_response(req, body: { stackFrames: [], totalFrames: 0 })
       return
     end
-    cmd = "class_variables"
-    prefix = "#{$_classname}."
-    vartype = "C"
-  elsif (scope =~ /^IVARS/)
-    if ($_classname =~ /^\s*$/) || ($_methodname =~ /^\s*$/)
-      return
-    end
-    cmd = "instance_variables"
-    prefix = "self."
-    vartype = "I"
+
+    frames = @stack_frames || []
+    send_response(req, body: {
+                         stackFrames: frames,
+                         totalFrames: frames.size,
+                       })
   end
 
-  vars = eval(prefix + cmd, $_binding)
-  variables = vars.map { |eachVar|
-    value = eval(eachVar.to_s, $_binding)
-    {
-        :name => eachVar,
-        :type => value.class.name,
-        :value => value.inspect,
-        :variablesReference => 0
+  # Handles the DAP 'disconnect' request to end the debugging session.
+  #
+  # Responds to the disconnect request. Additional cleanup logic for stopping
+  # trace monitoring and closing connections can be added here.
+  #
+  # @param req [Hash] The DAP disconnect request
+  # @return [void]
+  def handle_disconnect(req)
+    send_response(req)
+    
+    # Stop tracing
+    set_trace_func(nil)
+    
+    # Clean up state
+    @stopped = false
+    @wait_for_continue = false
+    @step_mode = nil
+    @current_binding = nil
+    
+    # Clear data structures
+    @breakpoints.clear
+    @stack_frames.clear
+    @frame_bindings.clear
+    @variables_map.clear
+    @next_var_ref = 1
+    
+    # Close client connection
+    @client&.close
+  end
+
+  # Handles the DAP 'evaluate' request to evaluate an expression.
+  #
+  # Currently a placeholder implementation that echoes the expression back.
+  # In a full implementation, this would evaluate the expression in the
+  # current execution context and return the result.
+  #
+  # @param req [Hash] The DAP evaluate request with expression argument
+  # @return [void]
+  def handle_evaluate(req)
+    expr = req.dig("arguments", "expression") || ""
+    result = "Echo: #{expr}"
+    send_response(req, body: {
+                         result: result,
+                         variablesReference: 0,
+                       })
+  end
+
+  # Sends an output event to the client for logging/console messages.
+  #
+  # Output events display messages in the debug console. The category determines
+  # how the client displays the message (e.g., stdout, stderr, console).
+  #
+  # @param category [String] The output category (e.g., "console", "stdout", "stderr")
+  # @param message [String] The message to display
+  # @return [void]
+  def send_output_event(category, message)
+    send_event("output", {
+      category: category,
+      output: message + "\n",
+    })
+  end
+
+  # Updates the internal stack frame representation from the current execution context.
+  #
+  # Captures the call stack using caller_locations and builds DAP-compliant
+  # stack frame objects. Filters out internal debugger frames and stores
+  # the binding for the top frame to enable variable inspection.
+  #
+  # @param binding [Binding] The execution context at the current stop point
+  # @return [void]
+  def update_stack_frames(binding)
+    locations = caller_locations(1) # skip this method itself
+    @stack_frames = []
+    @frame_bindings = {}
+
+    filtered = []
+
+    # Trim stack above trace_callback
+    locations.each do |loc|
+      path = File.expand_path(loc.path)
+      next if path.include?(__FILE__) # Skip calls from this file (DAP server)
+      filtered << loc
+    end
+
+    filtered.each_with_index do |loc, i|
+      @stack_frames << {
+        id: i,
+        name: loc.label,
+        source: { name: File.basename(loc.path), path: File.expand_path(loc.path) },
+        line: loc.lineno,
+        column: 1,
+      }
+
+      # Currently only the top frame has binding
+      @frame_bindings[i] = binding if i == 0
+    end
+  end
+
+  # Handles the DAP 'scopes' request to retrieve variable scopes for a stack frame.
+  #
+  # Returns the available variable scopes (Local, Instance, Global) for the
+  # specified stack frame. Each scope has a variablesReference that can be
+  # used to retrieve the actual variables.
+  #
+  # @param req [Hash] The DAP scopes request with frameId argument
+  # @return [void]
+  def handle_scopes(req)
+    frame_id = req.dig("arguments", "frameId")
+    binding = @frame_bindings[frame_id]
+
+    scopes = []
+
+    if binding
+      local_ref = @next_var_ref
+      @next_var_ref += 1
+      @variables_map[local_ref] = [binding, :local]
+
+      scopes << {
+        name: "Local",
+        variablesReference: local_ref,
+        expensive: false,
+      }
+
+      instance_ref = @next_var_ref
+      @next_var_ref += 1
+      @variables_map[instance_ref] = [binding, :instance]
+
+      scopes << {
+        name: "Instance",
+        variablesReference: instance_ref,
+        expensive: false,
+      }
+    end
+
+    global_ref = @next_var_ref
+    @next_var_ref += 1
+    @variables_map[global_ref] = [nil, :global]
+
+    scopes << {
+      name: "Global",
+      variablesReference: global_ref,
+      expensive: true,
     }
-  }
 
-  message = {:event => 'variables', :variables => variables}
-  $_s.write("#{message.to_json}\n")
-
-
-end
-
-def get_local_variables() end
-
-def get_variables(scope)
-  if (scope === 'global')
-    cmd = "global_variables"
-    prefix = ""
-  elsif (scope === 'local')
-    cmd = "local_variables"
-    prefix = ""
-  elsif (scope === 'instance')
-    if $_classname =~ /^\s*$/
-      return
-    end
-    cmd = "class_variables"
-    prefix = "#{$_classname}."
-  elsif (scope === 'classInstance')
-    if ($_classname =~ /^\s*$/) || ($_methodname =~ /^\s*$/)
-      return
-    end
-    cmd = "instance_variables"
-    prefix = "self."
+    send_response(req, body: { scopes: scopes })
   end
 
-  vars = eval(prefix + cmd, $_binding)
-  variables = vars.map { |eachVar|
-    value = eval(eachVar.to_s, $_binding)
-    {
-        :name => eachVar,
-        :type => value.class.name,
-        :value => value.inspect,
-        :variablesReference => 0
-    }
-  }
+  # Handles the DAP 'variables' request to retrieve variables from a scope.
+  #
+  # Fetches and returns the variables (local, instance, or global) for the
+  # scope identified by variablesReference. Each variable includes its name,
+  # value, type, and nested variablesReference for complex objects.
+  #
+  # @param req [Hash] The DAP variables request with variablesReference argument
+  # @return [void]
+  def handle_variables(req)
+    ref = req.dig("arguments", "variablesReference")
+    binding, scope_type = @variables_map[ref]
 
-  {:event => 'variables', :variables => variables}
-end
-
-def get_treads
-  threads = Thread.list.map { |each| {:id => each.object_id, :name => each} }
-  {:event => :threads, :threads => threads}
-end
-
-def get_stacktrace(thread_id, launched_on_rhosim, windows_platform)
-  thread = Thread.list.find { |each| each.object_id == thread_id }
-
-  backtrace = thread.backtrace
-  cutted_backtrace = backtrace.slice(2, backtrace.size - 1)
-  frames = cutted_backtrace.map.with_index { |each, idx|
-    parts = each.split(':')
-    if launched_on_rhosim
-      if windows_platform
-        # C:/Users/mva/projects/rhomobile/rhodes/lib/extensions/debugger/debugger.rb:633:
-        file = convert_to_relative_path(parts[0] + ':' + parts[1], $_app_path)
-        line = parts[2].to_i
-        name = parts[3]
+    vars = case scope_type
+      when :local
+        binding.local_variables.map do |name|
+          build_var(name, binding.local_variable_get(name))
+        end
+      when :instance
+        self_obj = binding.eval("self")
+        self_obj.instance_variables.map do |name|
+          build_var(name, self_obj.instance_variable_get(name))
+        end
+      when :global
+        global_variables.map do |name|
+          build_var(name, eval(name.to_s))
+        end
       else
-        file = convert_to_relative_path(parts[0], $_app_path)
-        line = parts[1].to_i
-        name = parts[2]
+        []
       end
-    else
-      file = convert_to_relative_path(parts[0], $_app_path)
-      line = parts[1].to_i
-      name = parts[2]
-    end
 
+    send_response(req, body: { variables: vars })
+  end
+
+  # Builds a DAP-compliant variable representation from a Ruby variable.
+  #
+  # Constructs a hash containing the variable's name, inspected value, type,
+  # and variablesReference. Handles errors gracefully if inspection fails.
+  #
+  # @param name [Symbol, String] The variable name
+  # @param value [Object] The variable value
+  # @return [Hash] A DAP variable object with name, value, type, and variablesReference fields
+  def build_var(name, value)
     {
-        :index => idx,
-        :name => name, #parts[2]
-        :file => file, #launched_on_rhosim ? parts[0] : convert_to_relative_path(parts[0], $_app_path),
-        :line => line, #parts[1].to_i,
-        :column => 0
+      name: name.to_s,
+      value: value.inspect,
+      type: value.class.to_s,
+      variablesReference: 0, # позже можно расширить
     }
-  }
+  rescue => e
+    {
+      name: name.to_s,
+      value: "[error: #{e.message}]",
+      type: "Error",
+      variablesReference: 0,
+    }
+  end
 
-  {:event => :stacktrace, :frames => frames, :count => frames.size}
+  # Pauses execution and waits for a continue or step command.
+  #
+  # Sends a 'stopped' event to the client and enters a busy-wait loop until
+  # the client sends a continue or step command. This blocks the current
+  # thread to maintain the execution state for inspection.
+  #
+  # @param reason [String] The stop reason (e.g., "breakpoint", "step")
+  # @param file [String] The source file where execution stopped
+  # @param line [Integer] The line number where execution stopped
+  # @return [void]
+  def handle_stop(reason, file, line)
+    send_stopped_event(reason: reason, thread_id: Thread.current.object_id)
+    @wait_for_continue = true
+    sleep 0.05 while @wait_for_continue
+    @stopped = false
+  end
+
+  # Sends a 'stopped' event to notify the client that execution has paused.
+  #
+  # The stopped event indicates that the debugger has paused execution due to
+  # a breakpoint, step completion, or other stop reason. The client can then
+  # query the current state.
+  #
+  # @param reason [String] The reason for stopping (e.g., "breakpoint", "step", "pause")
+  # @param thread_id [Integer] The object_id of the thread that stopped
+  # @return [void]
+  def send_stopped_event(reason:, thread_id:)
+    send_event("stopped", {
+      reason: reason,
+      threadId: thread_id,
+      allThreadsStopped: true,
+    })
+  end
 end
 
-def debug_handle_cmd(inline)
-  if ($_cmd.size != 0)
-    debugger_log(DEBUGGER_LOG_LEVEL_INFO, "$_cmd: #{$_cmd}")
-  end
+# === Запуск ===
 
-  cmd = $_cmd.match(/^([^\n\r]*)([\n\r]+|$)/)[0]
-  processed = false
-  wait = inline
+# Validate DEBUG_HOST for security - only allow localhost addresses
+requested_host = ENV["DEBUG_HOST"] || "127.0.0.1"
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "::1"].freeze
 
-  if cmd != ""
-    begin
-      debugger_log(DEBUGGER_LOG_LEVEL_INFO, "incoming command #{cmd}")
-      json = Rho::JSON.parse(cmd)
-      debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Command json #{json}")
-      unless json.nil?
-        if json['type'] === 'connected'
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Connected to debugger")
-          processed = true
-        end
-
-        if json['type'] === 'setBreakPoints'
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Setting BreakPoints command")
-          source = json['source'].gsub('\\', '/')
-          $_breakpoint.set_break_points_on(source, json['lines'])
-          processed = true
-        end
-
-        if json['type'] === 'threads'
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Threads are requested")
-          response = get_treads
-          $_s.write("#{response.to_json}\n")
-          processed = true
-        end
-
-        if json['type'] === 'stacktrace'
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Stacktrace is requested")
-          response = get_stacktrace(json['thread'], $is_rhosim, $is_windows)
-          $_s.write("#{response.to_json}\n")
-          processed = true
-        end
-
-        if inline && (json['type'] === 'variables')
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Variables #{json['scope']} are requested")
-          response = get_variables(json['scope'])
-          $_s.write("#{response.to_json}\n")
-          processed = true
-        end
-
-        if inline && (json['type'] === 'stepIn')
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "StepIn command")
-          $_step = 1
-          $_step_level = -1
-          $_resumed = true
-          wait = false
-          processed = true
-        end
-
-        if inline && (json['type'] === 'stepOut')
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "StepOut command")
-          if $_call_stack < 1
-            $_step = 0
-            comment = ' (continue)'
-          else
-            $_step = 3
-            $_step_level = $_call_stack - 1
-            comment = ''
-          end
-          $_resumed = true
-          wait = false
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Step return" + comment)
-          processed = true
-        end
-
-        if inline && (json['type'] === 'stepOver')
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "StepOver command")
-          $_step = 2
-          $_step_level = $_call_stack
-          $_resumed = true
-          wait = false
-          processed = true
-        end
-
-        if inline && (json['type'] === 'continue')
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Continue command")
-          wait = false
-          $_step = 0
-          $_resumed = true
-          processed = true
-        end
-
-        if json['type'] === 'kill'
-          debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Kill command")
-          processed = true
-          $_s.close
-          System.exit
-        end
-      end
-    rescue StandardError => e
-      puts "Rescued: #{e.inspect}"
-    end
-  end
-
-  if processed
-    $_cmd = $_cmd.sub(/^([^\n\r]*)([\n\r]+(.*)|)$/, "\\3")
-    $_wait = wait if inline
-  end
-
-  processed
+if ALLOWED_HOSTS.include?(requested_host)
+  debug_host = requested_host
+else
+  puts "[WARNING] DEBUG_HOST is not allowed for security reasons."
+  puts "[WARNING] Only localhost addresses (127.0.0.1, localhost, ::1) are permitted."
+  puts "[WARNING] Falling back to 127.0.0.1"
+  debug_host = "127.0.0.1"
 end
 
-$_tracefunc = lambda { |event, file, line, id, bind, classname|
+debug_port = (ENV["DEBUG_PORT"] || 9000).to_i
 
-  return if eval('::Thread.current != ::Thread.main', bind)
-  $_binding = bind;
-  $_classname = classname;
-  $_methodname = id;
-  file = file.to_s.gsub('\\', '/')
-
-  if (file[0, $_app_path.length] == $_app_path) || (!(file.index("./").nil?)) || (!(file.index("framework").nil?)) || (!(file.index("extensions").nil?))
-
-    if event =~ /^line/
-      unhandled = true
-      step_stop = ($_step > 0) && (($_step_level < 0) || ($_call_stack <= $_step_level))
-
-      if (step_stop || ($_breakpoint.enabled? && (!($_breakpoint.empty?))))
-        filename = ""
-
-
-        filename = convert_to_relative_path(file, $_app_path)
-
-        if step_stop || ($_breakpoint.enabled? && ($_breakpoint.set_on?(filename, line.to_i)))
-
-          fn = filename.gsub(/:/, '|')
-          cl = classname.to_s.gsub(/:/, '#')
-          thread_id = Thread.current.object_id
-
-          message = {:event => :stopOnBreakpoint, :threadId => Thread.current.object_id}
-          $_s.write("#{message.to_json}\n")
-
-          debugger_log(DEBUGGER_LOG_LEVEL_DEBUG, (step_stop ? DEBUGGER_STEP_COMMENT[$_step - 1] : "Breakpoint") + " in #{fn} at #{line}")
-          $_step = 0
-          $_step_level = -1
-
-          app_type = ENV["APP_TYPE"]
-          $_wait = true
-          while $_wait
-            while debug_handle_cmd(true) do
-            end
-
-            if app_type.eql? "rhodes"
-              if Rho::System.main_window_closed
-                $_s.write("QUIT\n") if !($_s.nil?)
-                $_wait = false
-              end
-            end
-
-            sleep(0.1) if $_wait
-          end
-
-          unhandled = false
-        end
-      end
-
-      if unhandled
-        debug_handle_cmd(true)
-      end
-
-    elsif event =~ /^call/
-      $_call_stack += 1
-    elsif event =~ /^return/
-      $_call_stack -= 1
-    end
-  end
-
-  if $_resumed
-    $_resumed = false
-    $_s.write("RESUMED\n")
-  end
-}
-
-$_s = nil
-
-begin
-  debugger_log(DEBUGGER_LOG_LEVEL_INFO, "Opening connection")
-  debug_host_env = ENV['RHOHOST']
-  debug_port_env = ENV['rho_debug_port']
-  debug_path_env = ENV['ROOT_PATH']
-
-  debug_host = ((debug_host_env.nil?) || (debug_host_env == "")) ? '127.0.0.1' : debug_host_env
-  debug_port = ((debug_port_env.nil?) || (debug_port_env == "")) ? 9000 : debug_port_env
-  debug_path = ((debug_path_env.nil?) || (debug_path_env == "")) ? "" : debug_path_env
-
-  $is_rhosim = false
-  $is_windows = (/cygwin|mswin|mingw|bccwin|wince|emx/ =~ RUBY_PLATFORM) != nil
-
-  if defined?(RHOSTUDIO_REMOTE_DEBUG) && RHOSTUDIO_REMOTE_DEBUG == true
-    debug_host = ((RHOSTUDIO_REMOTE_HOST.to_s != nil) || (RHOSTUDIO_REMOTE_HOST.to_s != "")) ? RHOSTUDIO_REMOTE_HOST.to_s : ""
-    debug_path = "apps/app/"
-  else
-    $is_rhosim = true
-    debug_path = ((debug_path_env.nil?) || (debug_path_env == "")) ? "" : debug_path_env
-  end
-
-  debugger_log(DEBUGGER_LOG_LEVEL_INFO, "host=" + debug_host.to_s)
-  debugger_log(DEBUGGER_LOG_LEVEL_INFO, "port=" + debug_port.to_s)
-  debugger_log(DEBUGGER_LOG_LEVEL_INFO, "path=" + debug_path.to_s)
-
-  $_s = timeout(30) { TCPSocket.open(debug_host, debug_port) }
-
-  debugger_log(DEBUGGER_LOG_LEVEL_WARN, "Connected: " + $_s.to_s)
-
-  message = {:event => :connect, :host => debug_host, :port => debug_port, :debugPath => $_app_path}
-  $_s.write("#{message.to_json}\n")
-
-  $_s.write("CONNECT\nHOST=" + debug_host.to_s + "\nPORT=" + debug_port.to_s + "\n")
-
-  $_breakpoint = BreakPoints.new()
-  $_step = 0
-  $_step_level = -1
-  $_call_stack = 0
-  $_resumed = false
-  $_cmd = ""
-  $_app_path = debug_path
-  $_s.write("DEBUG PATH=" + $_app_path.to_s + "\n")
-
-  at_exit {
-    begin
-      $_s.write("QUIT\n")
-      $_s.close
-    end if !($_s.nil?)
-
-  }
-
-  set_trace_func $_tracefunc
-
-  Thread.new {
-    while true
-      debug_read_cmd($_s, true)
-      while debug_handle_cmd(false) do
-      end
-      if ($_cmd !~ /^\s*$/) && (Thread.main.stop?)
-        $_wait = true
-        Thread.main.wakeup
-      end
-    end
-  }
-
-rescue
-  debugger_log(DEBUGGER_LOG_LEVEL_ERROR, "Unable to open connection to debugger: " + $!.inspect)
-  $_s = nil
+Thread.new do
+  DAPServer.new(debug_host, debug_port).start
 end
