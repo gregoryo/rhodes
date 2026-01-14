@@ -33,7 +33,7 @@ class DAPServer
   # @param host [String] The hostname or IP address to bind the server to (e.g., "localhost", "127.0.0.1")
   # @param port [Integer] The port number to listen on for DAP client connections
   def initialize(host, port)
-    @breakpoints = {}  # key: path, value: Set of line numbers
+    @breakpoints = {}  # key: file path, value: Set of line numbers
     @current_binding = nil
     @stack_frames = []
     @frame_bindings = {}
@@ -337,7 +337,7 @@ class DAPServer
   def handle_stack_trace(req)
     thread_id = req.dig("arguments", "threadId")
 
-    # For MVP: support only the main thread
+    # Currently supports only the main thread
     if Thread.main.object_id != thread_id
       send_response(req, body: { stackFrames: [], totalFrames: 0 })
       return
@@ -412,7 +412,7 @@ class DAPServer
     # Trim stack above trace_callback
     locations.each do |loc|
       path = File.expand_path(loc.path)
-      next if path.include?(__FILE__) # skip calls from this file (DAP server)
+      next if path.include?(__FILE__) # Skip calls from this file (DAP server)
       filtered << loc
     end
 
@@ -425,7 +425,7 @@ class DAPServer
         column: 1,
       }
 
-      # currently only the top frame has binding
+      # Currently only the top frame has binding
       @frame_bindings[i] = binding if i == 0
     end
   end
