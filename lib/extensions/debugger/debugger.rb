@@ -33,7 +33,7 @@ class DAPServer
   # @param host [String] The hostname or IP address to bind the server to (e.g., "localhost", "127.0.0.1")
   # @param port [Integer] The port number to listen on for DAP client connections
   def initialize(host, port)
-    @breakpoints = {}  # ключ: путь, значение: Set строк
+    @breakpoints = {}  # key: path, value: Set of line numbers
     @current_binding = nil
     @stack_frames = []
     @frame_bindings = {}
@@ -320,7 +320,7 @@ class DAPServer
     lines = breakpoints.map { |bp| bp["line"] }.to_set
     @breakpoints[source] = lines
 
-    # Подтверждение установки
+    # Confirm breakpoint installation
     send_response(req, body: {
                          breakpoints: lines.map { |line| { verified: true, line: line } },
                        })
@@ -337,7 +337,7 @@ class DAPServer
   def handle_stack_trace(req)
     thread_id = req.dig("arguments", "threadId")
 
-    #Для MVP: поддержка только главного потока
+    # For MVP: support only the main thread
     if Thread.main.object_id != thread_id
       send_response(req, body: { stackFrames: [], totalFrames: 0 })
       return
@@ -359,7 +359,7 @@ class DAPServer
   # @return [void]
   def handle_disconnect(req)
     send_response(req)
-    # Доп. логика: остановить обработку, закрыть соединение и т. д.
+    # Additional logic: stop processing, close connection, etc.
   end
 
   # Handles the DAP 'evaluate' request to evaluate an expression.
@@ -409,10 +409,10 @@ class DAPServer
 
     filtered = []
 
-    # Обрезаем стек выше trace_callback
+    # Trim stack above trace_callback
     locations.each do |loc|
       path = File.expand_path(loc.path)
-      next if path.include?(__FILE__) # пропускаем вызовы из этого файла (DAP-сервер)
+      next if path.include?(__FILE__) # skip calls from this file (DAP server)
       filtered << loc
     end
 
@@ -425,7 +425,7 @@ class DAPServer
         column: 1,
       }
 
-      # пока только верхний frame имеет binding
+      # currently only the top frame has binding
       @frame_bindings[i] = binding if i == 0
     end
   end
